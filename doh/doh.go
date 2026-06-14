@@ -1,38 +1,106 @@
 // Package doh is the library behind the doh command line:
-// the HTTP client, request shaping, and the typed data models for doh.
+// the HTTP client, request shaping, and the typed data models for DNS over HTTPS.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
+// DNS queries are made to Google's public DoH API (dns.google/resolve).
 package doh
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to doh. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to dns.google.
 const DefaultUserAgent = "doh/dev (+https://github.com/tamnd/doh-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at doh.com; change it once you
-// know the real endpoints you want to read.
-const Host = "doh.com"
+// Host is the DNS-over-HTTPS resolver host.
+const Host = "dns.google"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to doh over HTTP.
+// typeNames maps DNS record type numbers to their string names.
+var typeNames = map[int]string{
+	1:   "A",
+	2:   "NS",
+	5:   "CNAME",
+	6:   "SOA",
+	12:  "PTR",
+	15:  "MX",
+	16:  "TXT",
+	28:  "AAAA",
+	33:  "SRV",
+	255: "ANY",
+}
+
+// statusNames maps DNS RCODE values to human-readable names.
+var statusNames = map[int]string{
+	0: "NOERROR",
+	1: "FORMERR",
+	2: "SERVFAIL",
+	3: "NXDOMAIN",
+	4: "NOTIMP",
+	5: "REFUSED",
+}
+
+// Config holds per-client tunables.
+type Config struct {
+	BaseURL string
+	Rate    time.Duration
+	Retries int
+	Timeout time.Duration
+}
+
+// DefaultConfig returns sensible defaults for the DoH client.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL: BaseURL,
+		Rate:    0,
+		Retries: 3,
+		Timeout: 10 * time.Second,
+	}
+}
+
+// Record is one DNS resource record returned by a resolve call.
+type Record struct {
+	Name string `json:"name"`
+	Type string `json:"type"` // "A", "AAAA", "MX", "TXT", etc.
+	TTL  int    `json:"ttl"`
+	Data string `json:"data"`
+}
+
+// wire types for JSON decoding
+
+type wireResponse struct {
+	Status    int           `json:"Status"`
+	Question  []wireQuestion `json:"Question"`
+	Answer    []wireRecord  `json:"Answer"`
+	Authority []wireRecord  `json:"Authority"`
+}
+
+type wireQuestion struct {
+	Name string `json:"name"`
+	Type int    `json:"type"`
+}
+
+type wireRecord struct {
+	Name string `json:"name"`
+	Type int    `json:"type"`
+	TTL  int    `json:"TTL"`
+	Data string `json:"data"`
+}
+
+// Client talks to dns.google over HTTPS.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,15 +108,55 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
+}
+
+// Resolve queries dns.google for the given domain and record type (e.g. "A", "MX").
+// It returns all answer and authority records, or an error if the DNS status is non-zero.
+func (c *Client) Resolve(ctx context.Context, domain, recordType string) ([]Record, error) {
+	url := c.BaseURL + "/resolve?name=" + domain + "&type=" + recordType
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+
+	var wr wireResponse
+	if err := json.Unmarshal(body, &wr); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+
+	if wr.Status != 0 {
+		name, ok := statusNames[wr.Status]
+		if !ok {
+			name = fmt.Sprintf("status %d", wr.Status)
+		}
+		return nil, fmt.Errorf("DNS error: %s (%d)", name, wr.Status)
+	}
+
+	all := append(wr.Answer, wr.Authority...)
+	records := make([]Record, 0, len(all))
+	for _, w := range all {
+		typeName, ok := typeNames[w.Type]
+		if !ok {
+			typeName = fmt.Sprintf("TYPE%d", w.Type)
+		}
+		records = append(records, Record{
+			Name: w.Name,
+			Type: typeName,
+			TTL:  w.TTL,
+			Data: w.Data,
+		})
+	}
+	return records, nil
 }
 
 // Get fetches url and returns the response body. It paces and retries according
@@ -121,80 +229,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on doh.com. It is a stand-in for the typed records you
-// will model from the real doh endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `doh cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

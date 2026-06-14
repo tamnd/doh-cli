@@ -21,8 +21,7 @@ var (
 // the typed-error-to-exit-code mapping.
 //
 // To add a command, declare it in doh/domain.go with kit.Handle and it
-// appears here automatically. Reach for app.AddCommand only for a verb that does
-// not fit the emit-records shape, the way version does below.
+// appears here automatically.
 func NewApp() *kit.App {
 	id := doh.Domain{}.Info().Identity
 	id.Version = Version
